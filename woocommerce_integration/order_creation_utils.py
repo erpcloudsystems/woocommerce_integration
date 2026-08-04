@@ -14,6 +14,12 @@ GUEST_CUSTOMER_IDS = ("", "0")
 # item codes already in use in ERPNext, so new items get a prefixed code.
 ITEM_CODE_PREFIX = "WOO-"
 
+# custom_customer_category is mandatory on Sales Order but has no counterpart in
+# the WooCommerce payload, so every imported order is filed under this one
+# category. The Customer Category record must exist, or the insert fails on link
+# validation (ignore_mandatory does not skip that check).
+CUSTOMER_CATEGORY = "Website GP"
+
 
 def create_sales_order(order_data: dict, setup: dict | None = None):
     """Create a sales order with its dependencies."""
@@ -230,6 +236,7 @@ def create_order(order: dict, woocommerce_setup: dict, customer: str):
     sales_order.company = woocommerce_setup.default_company
     sales_order.po_no = sales_order.woocomm_order_id = cstr(order.get("id"))
     sales_order.naming_series = woocommerce_setup.sales_order_series
+    sales_order.custom_customer_category = CUSTOMER_CATEGORY
 
     created_date = datetime.fromisoformat(order.get("date_created")).date()
     sales_order.transaction_date = created_date
