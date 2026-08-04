@@ -239,9 +239,11 @@ def create_order(order: dict, woocommerce_setup: dict, customer: str):
 
     add_items_to_sales_order(order, sales_order, woocommerce_setup)
 
+    # Left as a draft on purpose: the fields the TCW submit validations require
+    # (shipping_method, way_of_pay, brand, ...) are not part of the WooCommerce
+    # payload, so submitting here would always fail. A user completes and submits.
     sales_order.flags.ignore_mandatory = True
     sales_order.insert()
-    sales_order.submit()
 
 
 def add_items_to_sales_order(order: dict, sales_order: dict, setup: dict):
