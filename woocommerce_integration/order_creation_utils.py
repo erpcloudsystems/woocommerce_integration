@@ -6,11 +6,28 @@ from frappe.utils import cstr, flt
 
 from woocommerce_integration.general_utils import get_woocommerce_setup
 
+# WooCommerce sends 0 as the customer id for a guest checkout, i.e. there is no
+# registered account on the webshop to map to a Customer in ERPNext.
+GUEST_CUSTOMER_IDS = ("", "0")
 
-def create_sales_order(order_data: dict, setup: dict):
+# WooCommerce product ids are plain integers and would collide with the numeric
+# item codes already in use in ERPNext, so new items get a prefixed code.
+ITEM_CODE_PREFIX = "WOO-"
+
+
+def create_sales_order(order_data: dict, setup: dict | None = None):
     """Create a sales order with its dependencies."""
     if not setup:
         setup = get_woocommerce_setup()
+
+    # Orders are re-sent on every modification, only import each one once
+    woocomm_order_id = cstr(order_data.get("id"))
+    if woocomm_order_id and (
+        existing := frappe.db.exists(
+            "Sales Order", {"woocomm_order_id": woocomm_order_id}
+        )
+    ):
+        return existing
 
     try:
         customer = create_update_customer(order_data)
@@ -24,25 +41,41 @@ def create_sales_order(order_data: dict, setup: dict):
 
 
 def create_update_customer(order_data: dict):
-    """Create or update a customer based on the order data."""
-    billing_data = order_data.get("billing")
-    customer_id = order_data.get("customer_id")
-    customer_name = billing_data.get("first_name") + " " + billing_data.get("last_name")
+    """Find the customer the order belongs to, or create one."""
+    billing_data = order_data.get("billing") or {}
 
-    # Customer could have been created manually which may differ in naming
-    # always check woocomm_customer_id
-    if erp_customer := frappe.db.exists(
-        "Customer", {"woocomm_customer_id": customer_id}
-    ):
+    # cstr: woocomm_customer_id is a Data field, so filtering it by an int makes
+    # MySQL cast the column instead of the value, and '' = 0 is true there. That
+    # matched an arbitrary customer whose field was never set.
+    customer_id = cstr(order_data.get("customer_id")).strip()
+    is_guest = customer_id in GUEST_CUSTOMER_IDS
+
+    erp_customer = None
+    if not is_guest:
+        # Customer could have been created manually which may differ in naming
+        # always check woocomm_customer_id
+        erp_customer = frappe.db.exists(
+            "Customer", {"woocomm_customer_id": customer_id}
+        )
+
+    if not erp_customer:
+        erp_customer = find_customer_by_contact(billing_data)
+
+    if erp_customer:
         customer = frappe.get_doc("Customer", erp_customer)
+        # customer_name is deliberately left alone: the order only carries the
+        # name typed at checkout and must not overwrite the customer record
+        # maintained in ERPNext.
+        if not is_guest and not customer.woocomm_customer_id:
+            customer.db_set(
+                "woocomm_customer_id", customer_id, update_modified=False
+            )
     else:
         customer = frappe.new_doc("Customer")
-        customer.name = customer_id
-
-    customer.customer_name = customer_name
-    customer.woocomm_customer_id = customer_id
-    customer.flags.ignore_mandatory = True
-    customer.save()
+        customer.customer_name = get_customer_name(billing_data, order_data)
+        customer.woocomm_customer_id = None if is_guest else customer_id
+        customer.flags.ignore_mandatory = True
+        customer.insert()
 
     # Create address/contact if does not exist
     create_address(billing_data, customer, "Billing")
@@ -52,26 +85,91 @@ def create_update_customer(order_data: dict):
     return customer
 
 
-def get_uom(sku: str | None, default_uom: str):
-    """Get the SKU from WooCommerce or the default UOM for the item."""
-    if sku and not frappe.db.exists("UOM", sku):
-        frappe.get_doc({"doctype": "UOM", "uom_name": sku}).save()
+def get_customer_name(billing_data: dict, order_data: dict) -> str:
+    """Build a customer name from the billing details, which may be partial."""
+    name = " ".join(
+        part
+        for part in (billing_data.get("first_name"), billing_data.get("last_name"))
+        if part
+    ).strip()
 
-    return sku or (default_uom or "Nos")
+    return (
+        name
+        or cstr(billing_data.get("email")).strip()
+        or _("WooCommerce Order {0}").format(order_data.get("id"))
+    )
+
+
+def find_customer_by_contact(billing_data: dict) -> str | None:
+    """Match a guest checkout to an existing customer by email or phone."""
+    email = cstr(billing_data.get("email")).strip()
+    phone = cstr(billing_data.get("phone")).strip()
+    if not email and not phone:
+        return None
+
+    for contact in get_matching_contacts(email, phone):
+        if customer := frappe.db.get_value(
+            "Dynamic Link",
+            {
+                "parenttype": "Contact",
+                "parent": contact,
+                "link_doctype": "Customer",
+            },
+            "link_name",
+        ):
+            return customer
+
+    return None
+
+
+def get_matching_contacts(email: str, phone: str) -> list[str]:
+    """Contacts carrying the given email or phone, primary field and child rows."""
+    contacts = []
+    if email:
+        contacts += frappe.get_all("Contact", filters={"email_id": email}, pluck="name")
+        contacts += frappe.get_all(
+            "Contact Email", filters={"email_id": email}, pluck="parent"
+        )
+
+    if phone:
+        contacts += frappe.get_all(
+            "Contact Phone", filters={"phone": phone}, pluck="parent"
+        )
+
+    return list(dict.fromkeys(contacts))
+
+
+def get_linked_docs(doctype: str, customer: str) -> list[str]:
+    """Names of the doctype's records linked to the customer."""
+    return frappe.get_all(
+        "Dynamic Link",
+        filters={
+            "parenttype": doctype,
+            "link_doctype": "Customer",
+            "link_name": customer,
+        },
+        pluck="parent",
+    )
 
 
 def create_address(raw_data: dict, customer: dict, address_type: str):
     """Create an address for the customer if it does not exist."""
-    if frappe.db.exists(
-        "Address",
-        {
-            "pincode": raw_data.get("postcode"),
-            "address_line1": raw_data.get("address_1", "Not Provided"),
-            "woocomm_customer_id": customer.woocomm_customer_id,
-            "address_type": address_type,
-        },
-    ):
+    if not raw_data:
         return
+
+    # Scoped to the customer's own addresses: woocomm_customer_id is not set for
+    # guests, so it cannot be used to tell one buyer's address from another's.
+    if linked := get_linked_docs("Address", customer.name):
+        if frappe.db.exists(
+            "Address",
+            {
+                "name": ("in", linked),
+                "pincode": raw_data.get("postcode"),
+                "address_line1": raw_data.get("address_1", "Not Provided"),
+                "address_type": address_type,
+            },
+        ):
+            return
 
     address = frappe.new_doc("Address")
     address.address_title = customer.get("customer_name")
@@ -101,13 +199,9 @@ def create_contact(data: dict, customer: str):
     if not email and not phone:
         return
 
-    if frappe.db.exists(
-        "Contact",
-        {
-            "email_id": email,
-            "woocomm_customer_id": customer.woocomm_customer_id,
-        },
-    ):
+    # Scoped to the customer's own contacts, for the same reason as the address
+    linked = set(get_linked_docs("Contact", customer.name))
+    if linked.intersection(get_matching_contacts(cstr(email), cstr(phone))):
         return
 
     contact = frappe.new_doc("Contact")
@@ -134,7 +228,7 @@ def create_order(order: dict, woocommerce_setup: dict, customer: str):
     sales_order = frappe.new_doc("Sales Order")
     sales_order.customer = customer
     sales_order.company = woocommerce_setup.default_company
-    sales_order.po_no = sales_order.woocomm_order_id = order.get("id")
+    sales_order.po_no = sales_order.woocomm_order_id = cstr(order.get("id"))
     sales_order.naming_series = woocommerce_setup.sales_order_series
 
     created_date = datetime.fromisoformat(order.get("date_created")).date()
@@ -161,7 +255,8 @@ def add_items_to_sales_order(order: dict, sales_order: dict, setup: dict):
                 "item_name": item.item_name,
                 "description": item.description,
                 "delivery_date": sales_order.delivery_date,
-                "uom": get_uom(line_item.get("sku"), setup.default_uom),
+                # the item's own UOM, never the WooCommerce SKU
+                "uom": item.stock_uom or setup.default_uom or "Nos",
                 "qty": line_item.get("quantity"),
                 "rate": line_item.get("price"),
                 "warehouse": setup.default_warehouse,
@@ -189,26 +284,67 @@ def add_items_to_sales_order(order: dict, sales_order: dict, setup: dict):
 
 def get_item(item_data: dict, setup: dict) -> dict:
     """Get item document or create it if it does not exist."""
-    woo_com_id = item_data["product_id"]
+    # A line item of a variable product carries the bought variant in variation_id
+    woo_com_id = cstr(item_data.get("variation_id") or item_data.get("product_id"))
+    sku = cstr(item_data.get("sku")).strip()
+
     if erp_item := frappe.db.exists("Item", {"woocomm_product_id": woo_com_id}):
-        return frappe.db.get_values(
-            "Item", erp_item, ["name", "item_name", "description"], as_dict=True
-        )[0]
+        return get_item_values(erp_item)
 
-    return create_item(item_data, woo_com_id, setup)
+    # Items are usually maintained in ERPNext first, so fall back to the SKU
+    # before creating a duplicate of an item that is already there.
+    if erp_item := match_item_by_sku(sku):
+        # Store the mapping so the next order resolves on the first lookup
+        frappe.db.set_value(
+            "Item", erp_item, "woocomm_product_id", woo_com_id, update_modified=False
+        )
+        return get_item_values(erp_item)
+
+    return create_item(item_data, woo_com_id, sku, setup)
 
 
-def create_item(item_data: dict, woo_com_id: str, setup: dict):
+def get_item_values(item_code: str) -> dict:
+    return frappe.db.get_values(
+        "Item",
+        item_code,
+        ["name", "item_name", "description", "stock_uom"],
+        as_dict=True,
+    )[0]
+
+
+def match_item_by_sku(sku: str) -> str | None:
+    """Match the WooCommerce SKU against an item code or one of its barcodes."""
+    if not sku:
+        return None
+
+    if frappe.db.exists("Item", sku):
+        return sku
+
+    return frappe.db.get_value("Item Barcode", {"barcode": sku}, "parent")
+
+
+def create_item(item_data: dict, woo_com_id: str, sku: str, setup: dict):
     """Create an item based on the item data."""
     item = frappe.new_doc("Item")
-    item.item_code = cstr(woo_com_id)
-    item.item_name = item_data.get("name")
-    item.stock_uom = get_uom(item_data.get("sku"), setup.default_uom)
+    item.item_code = f"{ITEM_CODE_PREFIX}{woo_com_id}"
+    item.item_name = item_data.get("name") or item.item_code
+    item.stock_uom = setup.default_uom or "Nos"
     item.item_group = "WooCommerce Products"
     item.image = (item_data.get("image") or {}).get("src")
-    item.woocomm_product_id = cstr(woo_com_id)
+    item.woocomm_product_id = woo_com_id
     item.flags.ignore_mandatory = True
-    item.save()
+    item.insert()
+
+    # Surface it: an unmatched product usually means a missing SKU on the webshop
+    # rather than a genuinely new item, and the duplicate needs cleaning up.
+    frappe.log_error(
+        title=_("WooCommerce Notice: Item Created"),
+        message=_(
+            "No item matched WooCommerce product {0} (SKU: {1}), so {2} was created.\n"
+            "If this product already exists in ERPNext, set its WooCommerce Product "
+            "ID to {0} and delete {2}."
+        ).format(woo_com_id, sku or _("not set"), item.name),
+    )
 
     return item
 

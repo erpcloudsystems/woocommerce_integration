@@ -13,7 +13,7 @@ class WooCommerceConnector:
             consumer_key=self.consumer_key,
             consumer_secret=self.consumer_secret,
             wp_api=True,
-            verify_ssl=self.settings.verify_ssl,
+            verify_ssl=bool(cint(self.settings.verify_ssl)),
             version="wc/v3",
             timeout=1000,
         )
