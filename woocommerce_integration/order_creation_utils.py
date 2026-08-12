@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 
 import frappe
@@ -9,6 +10,21 @@ from woocommerce_integration.general_utils import get_woocommerce_setup
 # WooCommerce sends 0 as the customer id for a guest checkout, i.e. there is no
 # registered account on the webshop to map to a Customer in ERPNext.
 GUEST_CUSTOMER_IDS = ("", "0")
+
+# Phone numbers are stored as the country code followed by the 10 digit national
+# number (201017318848), the same shape the TCW Customer hook builds. WooCommerce
+# sends the local form the buyer types at checkout (01017318848), so numbers are
+# normalised before they are matched or saved, or the same buyer would come back
+# as a new customer on every order.
+COUNTRY_CODE = "20"
+NATIONAL_NUMBER_LENGTH = 10
+
+# Mobile fields checked by the TCW duplicate-mobile validation on Customer
+CUSTOMER_MOBILE_FIELDS = ("mobile_no", "mobile1", "custom_mobile_no3")
+
+# A shorter number cannot identify a buyer, and there are customer records
+# holding two and three digit leftovers that any of them would match.
+MIN_MATCHABLE_DIGITS = 9
 
 # WooCommerce product ids are plain integers and would collide with the numeric
 # item codes already in use in ERPNext, so new items get a prefixed code.
@@ -80,6 +96,7 @@ def create_update_customer(order_data: dict):
         customer = frappe.new_doc("Customer")
         customer.customer_name = get_customer_name(billing_data, order_data)
         customer.woocomm_customer_id = None if is_guest else customer_id
+        set_customer_mobile(customer, billing_data.get("phone"))
         customer.flags.ignore_mandatory = True
         customer.insert()
 
@@ -106,12 +123,86 @@ def get_customer_name(billing_data: dict, order_data: dict) -> str:
     )
 
 
+def normalize_phone(phone: str) -> str:
+    """Bring a phone number to the country code + national number form."""
+    digits = re.sub(r"\D", "", cstr(phone))
+    if not digits:
+        return ""
+
+    # Strip the international or trunk prefix the buyer may have typed, but only
+    # when what is left is a full national number, so a number of an unexpected
+    # length is never truncated into a different one.
+    for prefix in (f"00{COUNTRY_CODE}", COUNTRY_CODE, "0"):
+        if digits.startswith(prefix) and len(digits) - len(prefix) == (
+            NATIONAL_NUMBER_LENGTH
+        ):
+            return f"{COUNTRY_CODE}{digits[len(prefix):]}"
+
+    if len(digits) == NATIONAL_NUMBER_LENGTH:
+        return f"{COUNTRY_CODE}{digits}"
+
+    # Not a number we can interpret (landline, foreign, mistyped): keep the
+    # digits as they are so it is still matched literally.
+    return digits
+
+
+def get_phone_variants(phone: str) -> list[str]:
+    """Every form the number may already be stored in, canonical form first."""
+    normalized = normalize_phone(phone)
+    if not normalized:
+        return []
+
+    variants = [normalized]
+    if normalized.startswith(COUNTRY_CODE) and len(normalized) == len(
+        COUNTRY_CODE
+    ) + NATIONAL_NUMBER_LENGTH:
+        national = normalized[len(COUNTRY_CODE) :]
+        # Records entered by hand often kept the local form
+        variants += [national, f"0{national}"]
+
+    if (raw := cstr(phone).strip()) and raw not in variants:
+        variants.append(raw)
+
+    return variants
+
+
+def is_matchable_phone(phone: str) -> bool:
+    """Whether the number is complete enough to pin down a buyer."""
+    return len(re.sub(r"\D", "", cstr(phone))) >= MIN_MATCHABLE_DIGITS
+
+
+def set_customer_mobile(customer, phone: str):
+    """Store the checkout number on the customer in the format TCW expects.
+
+    mobile1 is written explicitly even when there is no usable number: the field
+    default is the bare country code, which the TCW duplicate-mobile validation
+    then matches against the customers whose mobile_no is that same placeholder,
+    failing every import with 'already used in customer'.
+    """
+    normalized = normalize_phone(phone)
+    customer.mobile_no = normalized
+    customer.mobile1 = (
+        normalized[len(COUNTRY_CODE) :]
+        if normalized.startswith(COUNTRY_CODE)
+        and len(normalized) == len(COUNTRY_CODE) + NATIONAL_NUMBER_LENGTH
+        else ""
+    )
+
+
 def find_customer_by_contact(billing_data: dict) -> str | None:
-    """Match a guest checkout to an existing customer by email or phone."""
+    """Match a checkout to an existing customer by phone or email."""
     email = cstr(billing_data.get("email")).strip()
     phone = cstr(billing_data.get("phone")).strip()
     if not email and not phone:
         return None
+
+    # The number is the identity of a buyer here, and it is validated as unique
+    # across customers, so it decides before the email does.
+    if customer := find_customer_by_mobile(phone):
+        return customer
+
+    if not is_matchable_phone(phone):
+        phone = ""
 
     for contact in get_matching_contacts(email, phone):
         if customer := frappe.db.get_value(
@@ -128,6 +219,21 @@ def find_customer_by_contact(billing_data: dict) -> str | None:
     return None
 
 
+def find_customer_by_mobile(phone: str) -> str | None:
+    """The customer already holding this number in one of its mobile fields."""
+    if not is_matchable_phone(phone):
+        return None
+
+    variants = get_phone_variants(phone)
+
+    for field in CUSTOMER_MOBILE_FIELDS:
+        for variant in variants:
+            if customer := frappe.db.get_value("Customer", {field: variant}, "name"):
+                return customer
+
+    return None
+
+
 def get_matching_contacts(email: str, phone: str) -> list[str]:
     """Contacts carrying the given email or phone, primary field and child rows."""
     contacts = []
@@ -137,9 +243,9 @@ def get_matching_contacts(email: str, phone: str) -> list[str]:
             "Contact Email", filters={"email_id": email}, pluck="parent"
         )
 
-    if phone:
+    if variants := get_phone_variants(phone):
         contacts += frappe.get_all(
-            "Contact Phone", filters={"phone": phone}, pluck="parent"
+            "Contact Phone", filters={"phone": ("in", variants)}, pluck="parent"
         )
 
     return list(dict.fromkeys(contacts))
@@ -186,7 +292,7 @@ def create_address(raw_data: dict, customer: dict, address_type: str):
     address.address_type = address_type
     address.state = raw_data.get("state")
     address.pincode = raw_data.get("postcode")
-    address.phone = raw_data.get("phone")
+    address.phone = normalize_phone(raw_data.get("phone"))
     address.email_id = raw_data.get("email")
 
     if country := raw_data.get("country"):
@@ -219,7 +325,9 @@ def create_contact(data: dict, customer: str):
     contact.is_billing_contact = 1
 
     if phone:
-        contact.add_phone(phone, is_primary_mobile_no=1, is_primary_phone=1)
+        contact.add_phone(
+            normalize_phone(phone), is_primary_mobile_no=1, is_primary_phone=1
+        )
 
     if email:
         contact.add_email(email, is_primary=1)
