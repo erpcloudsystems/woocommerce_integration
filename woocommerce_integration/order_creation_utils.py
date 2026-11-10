@@ -36,6 +36,15 @@ ITEM_CODE_PREFIX = "WOO-"
 # validation (ignore_mandatory does not skip that check).
 CUSTOMER_CATEGORY = "Website GP"
 
+# Orders paid online by card arrive already paid, so they are flagged for the TCW
+# Sales Order submit hook, which creates the Payment Entry when custom_return is
+# set. The Mode of Payment record must exist, for the same reason as above.
+CARD_PAYMENT_METHODS = ("geidea",)
+CARD_MODE_OF_PAYMENT = "Cash Genesisvit Pharma"
+
+# A card order whose payment did not go through has nothing to book
+UNPAID_ORDER_STATUSES = ("cancelled", "failed")
+
 
 def create_sales_order(order_data: dict, setup: dict | None = None):
     """Create a sales order with its dependencies."""
@@ -354,11 +363,30 @@ def create_order(order: dict, woocommerce_setup: dict, customer: str):
 
     add_items_to_sales_order(order, sales_order, woocommerce_setup)
 
+    is_card_paid = is_paid_by_card(order)
+    if is_card_paid:
+        sales_order.custom_return = 1
+        sales_order.custom_mode_of_payment = CARD_MODE_OF_PAYMENT
+
     # Left as a draft on purpose: the fields the TCW submit validations require
     # (shipping_method, way_of_pay, brand, ...) are not part of the WooCommerce
     # payload, so submitting here would always fail. A user completes and submits.
     sales_order.flags.ignore_mandatory = True
     sales_order.insert()
+
+    # Set after the insert, once grand_total has been calculated
+    if is_card_paid:
+        sales_order.db_set(
+            "custom_paid_amount_", sales_order.grand_total, update_modified=False
+        )
+
+
+def is_paid_by_card(order: dict) -> bool:
+    """Whether the buyer paid the order online by card."""
+    return (
+        cstr(order.get("payment_method")).strip().lower() in CARD_PAYMENT_METHODS
+        and cstr(order.get("status")).lower() not in UNPAID_ORDER_STATUSES
+    )
 
 
 def add_items_to_sales_order(order: dict, sales_order: dict, setup: dict):
